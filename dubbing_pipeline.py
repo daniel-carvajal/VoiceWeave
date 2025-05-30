@@ -308,8 +308,8 @@ class KokoroTTSClient:
                 # "input": "Hola, esto es una prueba",
                 "input": text,
                 "response_format": "mp3",
-                # "speed": speed
-                "speed": 1.0
+                "speed": speed
+                # "speed": 1.0
             }
             
             print(f"🎤 Kokoro synthesis: '{text[:50]}{'...' if len(text) > 50 else ''}' (voice: {voice})")
@@ -646,9 +646,9 @@ class VideoDubbingPipeline:
         
         print("✅ Translation completed")
         return segments
-    
+        
     def synthesize_audio(self, segments: List[DubSegment]) -> List[DubSegment]:
-        """Generate audio for all segments using Kokoro TTS"""
+        """Generate audio for all segments using Kokoro TTS with smart retry and overlap detection"""
         print(f"🎙️ Synthesizing audio for {len(segments)} segments...")
         
         if not self.tts_client.test_connection():
@@ -664,40 +664,166 @@ class VideoDubbingPipeline:
             
             print(f"   Synthesizing segment {i+1}/{len(segments)}")
             
-            # Calculate speed adjustment for timing
-            estimated_words = len(segment.translated_text.split())
-            estimated_duration = estimated_words * 0.6  # ~0.6 seconds per word average
-            speed_factor = estimated_duration / segment.target_duration
-            # final_speed = max(0.8, min(1.4, self.config.speed_adjustment * speed_factor)) # NEW: Clamp speed to reasonable range
-            final_speed = 1.0  # Instead of calculated speed
-
-            
-            # Synthesize audio
+            # Initial synthesis with natural speed
             audio_file = self.tts_client.synthesize(
                 segment.translated_text,
                 self.config.voice_model,
-                final_speed
+                1.0  # Start with natural speed
             )
             
             if audio_file:
-                segment.audio_file = audio_file
-                segment.adjusted_speed = final_speed
+                # Check actual duration vs target
+                actual_duration = self._get_audio_duration(audio_file)
+                duration_diff = abs(actual_duration - segment.target_duration)
                 
-                # # Adjust duration to match exactly
-                # adjusted_file = os.path.join(temp_dir, f"segment_{i:04d}_adjusted.wav")
-                # if AudioProcessor.adjust_audio_duration(audio_file, segment.target_duration, adjusted_file):
-                #     segment.audio_file = adjusted_file
-                #     segment.adjusted_speed = final_speed
-                # else:
-                #     segment.audio_file = audio_file
-                
-                # # Clean up temporary file
-                # if os.path.exists(audio_file) and audio_file != segment.audio_file:
-                #     os.unlink(audio_file)
+                # Only retry if WAY off (>2 seconds difference)
+                if duration_diff > 2.0:
+                    print(f"     ⚠️ Segment {i+1} duration off by {duration_diff:.1f}s, retrying with speed adjustment...")
+                    
+                    # Calculate speed adjustment
+                    speed_adjustment = actual_duration / segment.target_duration
+                    # Clamp to reasonable range
+                    speed_adjustment = max(0.7, min(1.5, speed_adjustment))
+                    
+                    # Retry with speed adjustment
+                    retry_audio = self.tts_client.synthesize(
+                        segment.translated_text,
+                        self.config.voice_model,
+                        speed_adjustment
+                    )
+                    
+                    if retry_audio:
+                        retry_duration = self._get_audio_duration(retry_audio)
+                        retry_diff = abs(retry_duration - segment.target_duration)
+                        
+                        # Use retry if it's better
+                        if retry_diff < duration_diff:
+                            print(f"     ✅ Retry improved timing: {retry_diff:.1f}s difference")
+                            # Clean up original
+                            if os.path.exists(audio_file):
+                                os.unlink(audio_file)
+                            segment.audio_file = retry_audio
+                            segment.adjusted_speed = speed_adjustment
+                        else:
+                            print(f"     📋 Original timing better, keeping it")
+                            # Clean up retry
+                            if os.path.exists(retry_audio):
+                                os.unlink(retry_audio)
+                            segment.audio_file = audio_file
+                            segment.adjusted_speed = 1.0
+                    else:
+                        # Retry failed, use original
+                        segment.audio_file = audio_file
+                        segment.adjusted_speed = 1.0
+                else:
+                    # Timing is good enough, use as-is
+                    segment.audio_file = audio_file
+                    segment.adjusted_speed = 1.0
+                    if duration_diff > 0.5:  # Only mention if somewhat noticeable
+                        print(f"     ✓ Timing acceptable: {duration_diff:.1f}s difference")
+        
+        # Check for overlaps between segments
+        print("🔍 Checking for segment overlaps...")
+        overlaps_detected = self._detect_overlaps(segments)
+        
+        if overlaps_detected:
+            print("🔧 Fixing overlapping segments...")
+            segments = self._fix_overlaps(segments)
         
         print("✅ Audio synthesis completed")
         return segments
-    
+
+    def _get_audio_duration(self, audio_file: str) -> float:
+        """Get duration of audio file in seconds"""
+        try:
+            if not AUDIO_LIBS_AVAILABLE:
+                # Fallback: estimate from file size (very rough)
+                file_size = os.path.getsize(audio_file)
+                return file_size / 32000  # Rough estimate for MP3
+            
+            # Use librosa to get precise duration
+            y, sr = librosa.load(audio_file)
+            return len(y) / sr
+        except Exception as e:
+            print(f"Warning: Could not get audio duration: {e}")
+            return 0.0
+
+    def _detect_overlaps(self, segments: List[DubSegment]) -> bool:
+        """Detect overlapping segments and report them"""
+        overlaps_found = False
+        
+        for i in range(len(segments) - 1):
+            current = segments[i]
+            next_segment = segments[i + 1]
+            
+            if not current.audio_file or not next_segment.audio_file:
+                continue
+                
+            # Calculate actual end time of current segment
+            current_duration = self._get_audio_duration(current.audio_file)
+            current_actual_end = current.start + current_duration
+            
+            # Check if current segment overlaps into next segment's time
+            overlap = current_actual_end - next_segment.start
+            
+            if overlap > 0.1:  # More than 0.1s overlap is significant
+                overlaps_found = True
+                print(f"     ⚠️ OVERLAP: Segment {i+1} runs {overlap:.1f}s into Segment {i+2}")
+                print(f"       Segment {i+1}: [{current.start:.2f}s - {current.end:.2f}s] actual ends at {current_actual_end:.2f}s")
+                print(f"       Segment {i+2}: starts at {next_segment.start:.2f}s")
+        
+        return overlaps_found
+
+    def _fix_overlaps(self, segments: List[DubSegment]) -> List[DubSegment]:
+        """Fix overlapping segments by speeding them up or truncating"""
+        for i in range(len(segments) - 1):
+            current = segments[i]
+            next_segment = segments[i + 1]
+            
+            if not current.audio_file or not next_segment.audio_file:
+                continue
+                
+            # Calculate overlap
+            current_duration = self._get_audio_duration(current.audio_file)
+            current_actual_end = current.start + current_duration
+            overlap = current_actual_end - next_segment.start
+            
+            if overlap > 0.1:  # Significant overlap
+                print(f"     🔧 Fixing overlap for Segment {i+1}...")
+                
+                # Try to fix by speeding up the current segment
+                max_allowed_duration = next_segment.start - current.start - 0.05  # Leave 50ms gap
+                needed_speed = current_duration / max_allowed_duration
+                
+                if needed_speed <= 1.5:  # Speed adjustment is reasonable
+                    print(f"       Retrying with {needed_speed:.2f}x speed...")
+                    
+                    retry_audio = self.tts_client.synthesize(
+                        current.translated_text,
+                        self.config.voice_model,
+                        needed_speed
+                    )
+                    
+                    if retry_audio:
+                        retry_duration = self._get_audio_duration(retry_audio)
+                        if retry_duration <= max_allowed_duration:
+                            print(f"       ✅ Fixed! New duration: {retry_duration:.1f}s")
+                            # Clean up old audio
+                            if os.path.exists(current.audio_file):
+                                os.unlink(current.audio_file)
+                            current.audio_file = retry_audio
+                            current.adjusted_speed = needed_speed
+                        else:
+                            print(f"       ⚠️ Speed adjustment didn't work well enough")
+                            # Clean up failed retry
+                            if os.path.exists(retry_audio):
+                                os.unlink(retry_audio)
+                else:
+                    print(f"       ⚠️ Required speed ({needed_speed:.2f}x) too extreme, leaving as-is")
+        
+        return segments
+
+
     def create_final_audio(self, segments: List[DubSegment], video_id: str) -> str:
         """Combine all segments into final dubbed audio track"""
         print("🎵 Creating final dubbed audio track...")
