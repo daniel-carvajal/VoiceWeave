@@ -1,0 +1,35 @@
+# TranscriptFusion + Video Dubbing Pipeline Requirements
+# Combined dependencies for the full video processing workflow
+
+# Core TranscriptFusion dependencies
+whisperx>=3.1.0
+yt-dlp>=2023.7.6
+youtube-transcript-api>=0.6.0
+requests>=2.31.0
+
+# Audio processing for dubbing pipeline
+torch>=2.0.0
+torchaudio>=2.0.0
+librosa>=0.10.0
+scipy>=1.10.0
+numpy>=1.24.0
+
+# OFFLINE TRANSLATION OPTIONS (choose one or more):
+transformers>=4.30.0    # Offline AI translation (recommended)
+# OR
+# googletrans==4.0.0rc1   # Free online translation (no API key needed)
+
+# OFFLINE TTS OPTIONS (choose one or more):
+pyttsx3>=2.90           # Cross-platform offline TTS (recommended)
+# OR
+gtts>=2.3.0             # Google TTS (online but free, no API key)
+
+# OPTIONAL: Premium services (require API keys)
+# openai>=1.0.0         # For OpenAI GPT-4 translation (better quality)
+
+# Video processing
+ffmpeg-python>=0.2.0   # Python wrapper for ffmpeg (optional)
+
+# Development and debugging (optional)
+matplotlib>=3.7.0      # For audio waveform visualization
+seaborn>=0.12.0        # For debugging charts
